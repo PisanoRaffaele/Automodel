@@ -352,6 +352,11 @@ def _uses_te_attention(model) -> bool:
     return _attention_backend(model) == "te" or bool(getattr(model, "_te_attention_injected", False))
 
 
+def _uses_flex_thd_attention(model) -> bool:
+    """Whether a live model consumes flattened THD packing through flex attention with a per-document mask."""
+    return _attention_backend(model) == "flex" and bool(getattr(model, "_flex_attention_consumes_thd", False))
+
+
 def _is_multimodal_model(model) -> bool:
     """Whether a live model owns a vision or audio tower."""
     config = getattr(model, "config", None)
@@ -421,7 +426,7 @@ def _prepare_cp_sharder(
     batch_is_thd = batch.get("qkv_format") == "thd"
     magi_state = _magi_state_from_model(model, device_mesh)
     magi_enabled = magi_state is not None and getattr(magi_state, "enabled", False)
-    backend_uses_thd = batch_is_thd and (magi_enabled or _uses_te_attention(model))
+    backend_uses_thd = batch_is_thd and (magi_enabled or _uses_te_attention(model) or _uses_flex_thd_attention(model))
     cp_sharder = None
     has_hook = model is not None and hasattr(model, "prepare_model_inputs_for_cp")
     effective_cp_size = _mesh_dim_size(device_mesh, "cp")

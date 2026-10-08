@@ -220,6 +220,9 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    # Flex attention masks packed THD batches per document (cu_seqlens_padded), so packed
+    # batches are flattened to THD for flex as they are for TE.
+    _flex_attention_consumes_thd: bool = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:

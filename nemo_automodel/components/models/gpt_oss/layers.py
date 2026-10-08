@@ -150,6 +150,18 @@ class GptOssAttention(nn.Module):
                 "sliding_window": (self.sliding_window if self.sliding_window is not None else 0),
                 "enable_gqa": True,
             }
+            if qkv_format == "thd":
+                if attn_kwargs.get("cp_size", 1) > 1:
+                    raise NotImplementedError("GPT-OSS flex attention does not support context parallelism with THD")
+                # Flex runs the packed stream as one [1, T, H, D] sequence with a per-document mask.
+                # Physical boundaries keep each slot's trailing pad inside its document, after the
+                # real tokens, so causality alone stops it from reaching them.
+                q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+                cu_seqlens = attn_kwargs.get("cu_seqlens_padded")
+                if cu_seqlens is None:
+                    cu_seqlens = attn_kwargs.get("cu_seqlens")
+                updated_attn_kwargs["cu_seqlens"] = cu_seqlens
+                attention_mask = None
         else:
             updated_attn_kwargs = attn_kwargs
             if qkv_format == "thd":
@@ -163,6 +175,8 @@ class GptOssAttention(nn.Module):
         )
         output = self.attn_func(q, k, v, **_attn_kwargs)
         output = postprocess_output_for_attn(output, self.backend.attn)
+        if self.backend.attn == "flex" and qkv_format == "thd":
+            output = output.squeeze(0)
 
         # Reshape and project output
         flatten_dim = 2 if qkv_format == "bshd" else 1

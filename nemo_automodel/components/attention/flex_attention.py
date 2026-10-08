@@ -53,6 +53,11 @@ class FlexAttention(torch.nn.Module):
     # Cache key to the created BlockMask. Matching layers can share a mask,
     # while different tensor geometries and devices receive distinct masks.
     block_masks: ClassVar[dict[FLEX_ATTN_MASK_T, BlockMask]] = {}
+    # Document masks depend on the packed boundaries, which change every batch. Only the masks
+    # for the boundaries currently in flight are kept: every layer of one forward (and its
+    # activation-checkpointing recompute) shares them, and a new layout evicts them all.
+    document_block_masks: ClassVar[dict[tuple[int, int, int, torch.device], BlockMask]] = {}
+    document_boundaries: ClassVar[tuple[int, ...] | None] = None
 
     def forward(
         self,
@@ -63,8 +68,9 @@ class FlexAttention(torch.nn.Module):
         sink_weights: torch.Tensor | None = None,
         sliding_window: int = 0,
         enable_gqa: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply FlexAttention with a cached causal or sliding-window mask.
+        """Apply FlexAttention with a cached causal, sliding-window, or packed-document mask.
 
         Args:
             q: Query tensor with shape ``[B, Hq, Sq, Dqk]``, where ``B`` is the batch size, ``Hq`` is the
@@ -76,6 +82,9 @@ class FlexAttention(torch.nn.Module):
             sink_weights: Optional attention-sink weights with shape ``[Hq]``.
             sliding_window: Number of causal tokens available to each query. ``0`` uses the full causal history.
             enable_gqa: Whether to enable grouped-query attention when ``Hq`` differs from ``Hkv``.
+            cu_seqlens: Optional int tensor ``[num_docs + 1]`` of physical document boundaries for a packed
+                sequence (``B == 1``, ``Sq == Skv``). When set, a query only attends to keys of its own document;
+                tokens at or past the last boundary form one trailing document.
 
         Returns:
             Attention output with shape ``[B, Hq, Sq, Dv]`` on the same device and with the same dtype as ``q``.
@@ -83,24 +92,30 @@ class FlexAttention(torch.nn.Module):
         batch_size, num_q_heads, q_len, _ = q.shape
         kv_len = k.shape[2]
 
-        mask_key = (sliding_window, batch_size, num_q_heads, q_len, kv_len, q.device)
-        if mask_key not in FlexAttention.block_masks:
-            if sliding_window is not None and sliding_window > 0:
-                mask_mod = FlexAttention._get_sliding_window_mask_mod(sliding_window)
-            else:
-                mask_mod = FlexAttention._get_causal_mask_mod()
-            block_mask = create_block_mask(
-                mask_mod,
-                batch_size,
-                num_q_heads,
-                q_len,
-                kv_len,
-                _compile=False,  # NOTE: _compile=True leads to hangs during sampling, so setting it to False for now
-                device=q.device,
-            )
-            FlexAttention.block_masks[mask_key] = block_mask
-
-        block_mask = FlexAttention.block_masks[mask_key]
+        if cu_seqlens is not None:
+            if batch_size != 1 or q_len != kv_len:
+                raise ValueError(
+                    f"Packed-document FlexAttention expects a single packed sequence with Sq == Skv, "
+                    f"got B={batch_size}, Sq={q_len}, Skv={kv_len}."
+                )
+            block_mask = FlexAttention._get_document_block_mask(cu_seqlens, sliding_window, q_len, q.device)
+        else:
+            mask_key = (sliding_window, batch_size, num_q_heads, q_len, kv_len, q.device)
+            if mask_key not in FlexAttention.block_masks:
+                if sliding_window is not None and sliding_window > 0:
+                    mask_mod = FlexAttention._get_sliding_window_mask_mod(sliding_window)
+                else:
+                    mask_mod = FlexAttention._get_causal_mask_mod()
+                FlexAttention.block_masks[mask_key] = create_block_mask(
+                    mask_mod,
+                    batch_size,
+                    num_q_heads,
+                    q_len,
+                    kv_len,
+                    _compile=False,  # NOTE: _compile=True leads to hangs during sampling, so setting it to False for now
+                    device=q.device,
+                )
+            block_mask = FlexAttention.block_masks[mask_key]
 
         if sink_weights is None:
             result: torch.Tensor = FlexAttention.flex_attn(
@@ -124,6 +139,44 @@ class FlexAttention(torch.nn.Module):
 
         out_tensor: torch.Tensor = out.to(q.dtype)
         return out_tensor
+
+    @staticmethod
+    def _get_document_block_mask(
+        cu_seqlens: torch.Tensor, sliding_window: int, seq_len: int, device: torch.device
+    ) -> BlockMask:
+        # The boundaries go to the host once per call; keying the cache on their values means a
+        # mask can never be reused for a different packing layout.
+        boundaries = tuple(cu_seqlens.tolist())
+        if boundaries != FlexAttention.document_boundaries:
+            FlexAttention.document_block_masks.clear()
+            FlexAttention.document_boundaries = boundaries
+
+        mask_key = (sliding_window, seq_len, len(boundaries), device)
+        if mask_key not in FlexAttention.document_block_masks:
+            positions = torch.arange(seq_len, device=device)
+            ends = cu_seqlens[1:].to(device=device, dtype=positions.dtype).contiguous()
+            # document_ids[i] = number of document ends <= i; tokens past the last end share one extra id.
+            document_ids = torch.searchsorted(ends, positions, right=True)
+
+            def document_mask(
+                b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+            ) -> torch.Tensor:
+                keep = (document_ids[q_idx] == document_ids[kv_idx]) & (kv_idx <= q_idx)
+                if sliding_window > 0:
+                    keep = keep & (q_idx - kv_idx < sliding_window)
+                return keep
+
+            FlexAttention.document_block_masks[mask_key] = create_block_mask(
+                document_mask,
+                1,
+                None,
+                seq_len,
+                seq_len,
+                _compile=False,  # NOTE: _compile=True leads to hangs during sampling, so setting it to False for now
+                device=device,
+            )
+
+        return FlexAttention.document_block_masks[mask_key]
 
     @staticmethod
     def _get_sliding_window_mask_mod(window: int) -> _mask_mod_signature:
