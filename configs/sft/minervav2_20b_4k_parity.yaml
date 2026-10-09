@@ -1,0 +1,140 @@
+# Parity run: AutoModel (+ flex doc-mask patch) vs LLaMA-Factory
+# minervav2_4k_full_b1Mtok_bf16_lr1e5_ep1_dromedario-tulu-4n-packedfix: same base, data and packing
+# (greedy knapsack), 1 epoch, 256 x 4096 tok/step, AdamW lr 1e-5 linear, 3% warmup, seed 42,
+# fp32 master weights (like ZeRO-3). Left different: val split (every 200th row vs LF's random 0.5%).
+#
+# This one file drives every step:
+#   ./run.sh src/model/sftbase.py     configs/sft/minervav2_20b_4k_parity.yaml   # login node, once
+#   ./run.sh src/data/split.py        configs/sft/minervav2_20b_4k_parity.yaml   # login node, once
+#   ./run.sh slurm/prepack.sbatch.sh  configs/sft/minervav2_20b_4k_parity.yaml   # CPU job, once
+#   ./run.sh slurm/sft.sbatch.sh      configs/sft/minervav2_20b_4k_parity.yaml
+# Debug = same config + overrides (any key, run.* included):
+#   ./run.sh slurm/sft.sbatch.sh configs/sft/minervav2_20b_4k_parity.yaml --run.nodes=5 --run.train_nodes=4 \
+#     --run.qos=boost_qos_dbg --run.time=00:30:00 --step_scheduler.global_batch_size=16 \
+#     --step_scheduler.max_steps=3 --checkpoint.enabled=false
+
+# Offline preparation (src/); ignored by the recipe.
+prep:
+  # src/model/sftbase.py: this pretraining ckpt -> model.pretrained_model_name_or_path.
+  base_ckpt: /leonardo_scratch/large/userexternal/rpisano1/pretraing/MinervaV2-2048bs_nodrop_auxloss_0003_continual_parallel_anneal_en_it_CKPT_HF_merged/iter_0983125
+  special_tokens_desc: /leonardo/home/userexternal/rpisano1/LLAMA-factory-sft/sft/minervav2/special_tokens_desc.yaml
+  # src/data/split.py: <name>.jsonl -> <name>.train.jsonl / <name>.val.jsonl (every val_every-th row).
+  # src/data/prepack.py: those splits -> dataset.path / validation_dataset.path.
+  sources:
+    - /leonardo_scratch/large/userexternal/rpisano1/sft_data/dromedario-3-sft-transl.jsonl
+    - /leonardo_scratch/large/userexternal/rpisano1/sft_data/tulu-3-sft-mixture.jsonl
+  val_every: 200
+
+# Slurm job (run.sh -> sbatch); ignored by the recipe.
+run:
+  # bprod needs >= 65 nodes; train on 64 (256 GPUs = 256 seqs/step, 1 per GPU, no grad accumulation).
+  nodes: 65
+  train_nodes: 64
+  qos: boost_qos_bprod
+  time: "06:00:00"
+  # lrdn1209 cannot resolve other nodes' hostnames (2026-10-09); keep it out.
+  exclude: lrdn1209
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 1
+  num_epochs: 1
+  ckpt_every_steps: 500  # + always saved at the last step (step_scheduler.is_last_step)
+  val_every_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /leonardo_scratch/fast/FAIR_NLP/rpisano1/models/MinervaV2-iter0983125-anneal-sftbase
+  # fp32 master weights + optimizer states (compute stays bf16 via FSDP mp_policy).
+  torch_dtype: float32
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # Flex attention: sinks + sliding window + per-document mask for packed (thd) batches.
+    # TE attention can't do sinks with packing on A100 (unfused rejects pad_between_seqs,
+    # cuDNN sinks need Hopper); the doc mask is the local patch in flex_attention.py.
+    attn: flex
+    # Non-fused RoPE reads the collator's per-document position_ids. Fused (TE) RoPE derives
+    # positions from the real-length cu_seqlens and would shift docs after a padding gap.
+    rope_fusion: false
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: torch
+    enable_hf_state_dict_adapter: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # EP inside the node (4 GPUs, NVLink); 32 experts -> 8 per GPU.
+  ep_size: 4
+  sequence_parallel: false
+  activation_checkpointing: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  # Packed offline by src/data/prepack.py: same ChatDataset tokenization, greedy-knapsack bins
+  # (like LF neat_packing), AutoModel's own pack layout. Memory-mapped; no per-rank tokenization.
+  _target_: data.prepacked.load_prepacked
+  path: /leonardo_scratch/large/userexternal/rpisano1/sft_data/packed/dromedario-tulu_train_4096
+
+packed_sequence:
+  packed_sequence_size: 4096
+  prepacked: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: data.prepacked.load_prepacked
+  path: /leonardo_scratch/large/userexternal/rpisano1/sft_data/packed/dromedario-tulu_val_4096
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  foreach: false
+
+lr_scheduler:
+  lr_decay_style: linear
+  lr_warmup_steps: 30  # ~3% of ~1000 steps/epoch
+  min_lr: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/minervav2_4k_full_b1Mtok_fp32m_lr1e5_ep1_dromedario-tulu-64n-automodel
+  model_save_format: safetensors
+  save_consolidated: final
+  # fp32 model + optimizer is ~250 GB per checkpoint; saves at ~500, ~1000 and the last step.
+  max_recent_checkpoints: 5
+
+wandb:
+  project: minervav2-sft
+  name: minervav2_4k_full_b1Mtok_fp32m_lr1e5_ep1_dromedario-tulu-64n-automodel
+  dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/wandb
