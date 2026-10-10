@@ -11,6 +11,7 @@ Usage (CPU job):  ./run.sh slurm/prepack.sbatch.sh <config.yaml>
 
 import multiprocessing as mp
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -30,21 +31,25 @@ CHUNK = 5000
 cfg = yaml.safe_load(open(sys.argv[1]))
 PACK = cfg["packed_sequence"]["packed_sequence_size"]
 tok = AutoTokenizer.from_pretrained(cfg["model"]["pretrained_model_name_or_path"])
-ds = None  # set per split; pool workers inherit it via fork
+ds, TMP = None, None  # set per split; pool workers inherit them via fork
 
 
-def tokenize(start: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Rows [start, start + CHUNK) -> flat input_ids, flat labels, per-row lengths."""
-    ids, labels, lens = [], [], []
-    for i in range(start, min(start + CHUNK, len(ds))):
-        s = ds[i]
-        lab = s["labels"]
-        if s.get("loss_mask"):  # same handling as packed_sequence.pack_dataset
-            lab = _fill_labels_with_cross_entropy_ignore_idx(lab, s["loss_mask"])
-        ids += s["input_ids"]
-        labels += lab
-        lens.append(len(s["input_ids"]))
-    return np.array(ids, np.int32), np.array(labels, np.int32), np.array(lens, np.int64)
+def tokenize(start: int) -> str:
+    """Rows [start, start + CHUNK) -> one int32 shard on disk (kept, so a rerun resumes)."""
+    path = f"{TMP}/{start:09d}.npz"
+    if not os.path.exists(path):
+        ids, labels, lens = [], [], []
+        for i in range(start, min(start + CHUNK, len(ds))):
+            s = ds[i]
+            lab = s["labels"]
+            if s.get("loss_mask"):  # same handling as packed_sequence.pack_dataset
+                lab = _fill_labels_with_cross_entropy_ignore_idx(lab, s["loss_mask"])
+            ids += s["input_ids"]
+            labels += lab
+            lens.append(len(s["input_ids"]))
+        np.savez(path + ".part.npz", ids=np.array(ids, np.int32), labels=np.array(labels, np.int32), lens=lens)
+        os.replace(path + ".part.npz", path)
+    return path
 
 
 def packs():
@@ -65,10 +70,22 @@ if __name__ == "__main__":
     for split, key in (("val", "validation_dataset"), ("train", "dataset")):
         out = cfg[key]["path"]
         files = [src.removesuffix(".jsonl") + f".{split}.jsonl" for src in cfg["prep"]["sources"]]
-        ds = ChatDataset(files, tok, seq_length=PACK, truncation=True)
+        ds, TMP = ChatDataset(files, tok, seq_length=PACK, truncation=True), out + ".tmp"
+        os.makedirs(TMP, exist_ok=True)
         with mp.get_context("fork").Pool(int(os.environ.get("SLURM_CPUS_PER_TASK", 4))) as pool:
-            ids, labels, lens = map(np.concatenate, zip(*pool.map(tokenize, range(0, len(ds), CHUNK))))
+            shards = pool.map(tokenize, range(0, len(ds), CHUNK))
+        ds = None  # the raw rows are no longer needed; free them before packing
+
+        # One flat token stream per field, filled shard by shard (no list of arrays + concatenate copy).
+        lens = np.concatenate([np.load(f)["lens"] for f in shards]).astype(np.int64)
         offsets = np.concatenate([[0], np.cumsum(lens)])
+        ids, labels = np.empty(offsets[-1], np.int32), np.empty(offsets[-1], np.int32)
+        pos = 0
+        for f in shards:
+            shard = np.load(f)
+            n = shard["ids"].size
+            ids[pos : pos + n], labels[pos : pos + n] = shard["ids"], shard["labels"]
+            pos += n
 
         bins = greedy_knapsack(lens.tolist(), PACK)
         print(
@@ -83,4 +100,5 @@ if __name__ == "__main__":
             }
         )
         Dataset.from_generator(packs, features=features, cache_dir=out + ".cache").save_to_disk(out)
+        shutil.rmtree(TMP), shutil.rmtree(out + ".cache")
         print(f"saved {out}", flush=True)
