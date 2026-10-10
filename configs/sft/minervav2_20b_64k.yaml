@@ -59,7 +59,8 @@ model:
     # Non-fused RoPE reads the collator's per-document position_ids. Fused (TE) RoPE derives
     # positions from the real-length cu_seqlens and would shift docs after a padding gap.
     rope_fusion: false
-    linear: te
+    # torch, not te: ChunkedCrossEntropy needs a plain nn.Linear lm_head.
+    linear: torch
     rms_norm: te
     experts: torch_mm
     dispatcher: torch
