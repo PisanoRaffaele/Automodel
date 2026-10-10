@@ -11,7 +11,7 @@
 # Debug = same config + overrides (any key, run.* included):
 #   ./run.sh slurm/sft.sbatch.sh configs/sft/minervav2_20b_4k_parity.yaml --run.nodes=5 --run.train_nodes=4 \
 #     --run.qos=boost_qos_dbg --run.time=00:30:00 --step_scheduler.global_batch_size=16 \
-#     --step_scheduler.max_steps=3 --checkpoint.enabled=false
+#     --step_scheduler.max_steps=3 --lr_scheduler.lr_warmup_steps=1 --checkpoint.enabled=false
 
 # Offline preparation (src/); ignored by the recipe.
 prep:
