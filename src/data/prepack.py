@@ -6,7 +6,7 @@ LLaMA-Factory's 1008). Here: ChatDataset (same tokenizer/template/truncation as 
 greedy knapsack (LF's neat_packing algorithm) -> AutoModel's own `_tensorize_and_pad_pack`, so the
 THD collator sees the usual layout. Writes dataset.path and validation_dataset.path.
 
-Usage (CPU job):  ./run.sh slurm/prepack.sbatch.sh <config.yaml>
+Usage (CPU job):  ./run.sh slurm/prepack.sbatch.sh <config.yaml> [val|train ...]   (default: both)
 """
 
 import multiprocessing as mp
@@ -34,9 +34,9 @@ tok = AutoTokenizer.from_pretrained(cfg["model"]["pretrained_model_name_or_path"
 ds, TMP = None, None  # set per split; pool workers inherit them via fork
 
 
-def tokenize(start: int) -> str:
-    """Rows [start, start + CHUNK) -> one int32 shard on disk (kept, so a rerun resumes)."""
-    path = f"{TMP}/{start:09d}.npz"
+def tokenize(prefix: str, start: int) -> str:
+    """Rows [start, start + CHUNK) of `ds` -> one int32 shard on disk (kept, so a rerun resumes)."""
+    path = f"{TMP}/{prefix}_{start:09d}.npz"
     if not os.path.exists(path):
         ids, labels, lens = [], [], []
         for i in range(start, min(start + CHUNK, len(ds))):
@@ -67,19 +67,24 @@ def packs():
 
 
 if __name__ == "__main__":
-    for split, key in (("val", "validation_dataset"), ("train", "dataset")):
-        out = cfg[key]["path"]
-        files = [src.removesuffix(".jsonl") + f".{split}.jsonl" for src in cfg["prep"]["sources"]]
-        ds, TMP = ChatDataset(files, tok, seq_length=PACK, truncation=True), out + ".tmp"
+    for split in sys.argv[2:] or ("val", "train"):
+        out = cfg["validation_dataset" if split == "val" else "dataset"]["path"]
+        TMP = out + ".tmp"
         os.makedirs(TMP, exist_ok=True)
-        with mp.get_context("fork").Pool(int(os.environ.get("SLURM_CPUS_PER_TASK", 4))) as pool:
-            shards = pool.map(tokenize, range(0, len(ds), CHUNK))
-        ds = None  # the raw rows are no longer needed; free them before packing
+        # One source at a time, so only one file's raw rows are in RAM.
+        shards = []
+        for src in cfg["prep"]["sources"]:
+            ds = ChatDataset([src.removesuffix(".jsonl") + f".{split}.jsonl"], tok, seq_length=PACK, truncation=True)
+            prefix = os.path.basename(src).removesuffix(".jsonl")
+            with mp.get_context("fork").Pool(int(os.environ.get("SLURM_CPUS_PER_TASK", 4))) as pool:
+                shards += pool.starmap(tokenize, [(prefix, s) for s in range(0, len(ds), CHUNK)])
+            ds = None
 
-        # One flat token stream per field, filled shard by shard (no list of arrays + concatenate copy).
+        # One flat token stream per field, memory-mapped on disk, filled shard by shard.
         lens = np.concatenate([np.load(f)["lens"] for f in shards]).astype(np.int64)
         offsets = np.concatenate([[0], np.cumsum(lens)])
-        ids, labels = np.empty(offsets[-1], np.int32), np.empty(offsets[-1], np.int32)
+        ids = np.lib.format.open_memmap(f"{TMP}/ids.npy", "w+", np.int32, (offsets[-1],))
+        labels = np.lib.format.open_memmap(f"{TMP}/labels.npy", "w+", np.int32, (offsets[-1],))
         pos = 0
         for f in shards:
             shard = np.load(f)

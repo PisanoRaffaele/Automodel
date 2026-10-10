@@ -1,0 +1,133 @@
+# MinervaV2-20B-A3 64k long-ctx base, full SFT, standard bf16 (weights + AdamW states in bf16).
+# Data: dromedario-3 + tulu-3 + dolci-instruct (deduped w.r.t. tulu), 1 epoch, packed to 65,536.
+# 16 nodes x 4 GPUs, 1 pack per GPU, no CP: 64 x 65,536 = 4,194,304 tok/step, AdamW lr 2e-5.
+#
+#   ./run.sh src/data/split.py        configs/sft/minervav2_20b_64k.yaml   # login node, once
+#   ./run.sh slurm/prepack.sbatch.sh  configs/sft/minervav2_20b_64k.yaml   # CPU job, once
+#   ./run.sh slurm/sft.sbatch.sh      configs/sft/minervav2_20b_64k.yaml
+# Debug (8 nodes = debug QOS max), on the val packs:
+#   ./run.sh slurm/sft.sbatch.sh configs/sft/minervav2_20b_64k.yaml --run.nodes=8 --run.qos=boost_qos_dbg \
+#     --run.time=00:30:00 --step_scheduler.global_batch_size=32 --step_scheduler.max_steps=2 \
+#     --lr_scheduler.lr_warmup_steps=1 --checkpoint.enabled=false --dataset.path=/leonardo_scratch/large/userexternal/rpisano1/sft_data/packed/minervav2_64k_val
+
+# Offline preparation (src/); ignored by the recipe.
+prep:
+  # model.pretrained_model_name_or_path was built by src/model/sftbase.py from
+  # /leonardo_scratch/fast/FAIR_NLP/pretrain/HF-ckpt-MinervaV2-2048bs_nodrop_auxloss_0003_longctx_64k_merged/iter_0005960
+  sources:
+    - /leonardo_scratch/large/userexternal/rpisano1/sft_data/dromedario-3-sft-transl.jsonl
+    - /leonardo_scratch/large/userexternal/rpisano1/sft_data/tulu-3-sft-mixture.jsonl
+    # TODO: dolci-instruct deduped w.r.t. tulu (path pending)
+  val_every: 200
+
+# Slurm job (run.sh -> sbatch); ignored by the recipe.
+run:
+  nodes: 16
+  qos: normal
+  time: "24:00:00"
+  # lrdn1209 cannot resolve other nodes' hostnames (2026-10-09); keep it out.
+  exclude: lrdn1209
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  num_epochs: 1
+  ckpt_every_steps: 100  # + always saved at the last step
+  val_every_steps: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /leonardo_scratch/fast/FAIR_NLP/rpisano1/models/MinervaV2-20b-a3-64k-sftbase
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # Flex attention: sinks + sliding window + per-document mask for packed (thd) batches.
+    # TE attention can't do sinks with packing on A100 (unfused rejects pad_between_seqs,
+    # cuDNN sinks need Hopper); the doc mask is the local patch in flex_attention.py.
+    attn: flex
+    # Non-fused RoPE reads the collator's per-document position_ids. Fused (TE) RoPE derives
+    # positions from the real-length cu_seqlens and would shift docs after a padding gap.
+    rope_fusion: false
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: torch
+    enable_hf_state_dict_adapter: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # EP inside the node (4 GPUs, NVLink); 32 experts -> 8 per GPU.
+  ep_size: 4
+  sequence_parallel: false
+  activation_checkpointing: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  # Projects + CEs 4096 tokens at a time: full fp32 logits at 64k x 128k vocab would be ~33 GB.
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  chunk_len: 4096
+
+dataset:
+  # Packed offline by src/data/prepack.py: same ChatDataset tokenization, greedy-knapsack bins
+  # (like LF neat_packing), AutoModel's own pack layout. Memory-mapped; no per-rank tokenization.
+  _target_: data.prepacked.load_prepacked
+  path: /leonardo_scratch/large/userexternal/rpisano1/sft_data/packed/minervav2_64k_train
+
+packed_sequence:
+  packed_sequence_size: 65536
+  prepacked: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: data.prepacked.load_prepacked
+  path: /leonardo_scratch/large/userexternal/rpisano1/sft_data/packed/minervav2_64k_val
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  foreach: false
+
+lr_scheduler:
+  lr_decay_style: linear
+  lr_warmup_steps: 15  # ~3% of the epoch; set from the prepack step count
+  min_lr: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/minervav2_64k_full_b4Mtok_bf16_lr2e5_ep1_dromedario-tulu-dolcidedup-16n-automodel
+  model_save_format: safetensors
+  save_consolidated: final
+  max_recent_checkpoints: 5
+
+wandb:
+  project: minervav2-sft
+  name: minervav2_64k_full_b4Mtok_bf16_lr2e5_ep1_dromedario-tulu-dolcidedup-16n-automodel
+  dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/wandb
