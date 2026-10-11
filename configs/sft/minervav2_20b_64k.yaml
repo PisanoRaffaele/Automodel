@@ -124,7 +124,7 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: linear
-  lr_warmup_steps: 15  # ~3% of the epoch; set from the prepack step count
+  lr_warmup_steps: 13  # 3% of 449 steps (28,708 packs / 64)
   min_lr: 0.0
 
 checkpoint:
