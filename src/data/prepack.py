@@ -83,8 +83,8 @@ if __name__ == "__main__":
         # One flat token stream per field, memory-mapped on disk, filled shard by shard.
         lens = np.concatenate([np.load(f)["lens"] for f in shards]).astype(np.int64)
         offsets = np.concatenate([[0], np.cumsum(lens)])
-        ids = np.lib.format.open_memmap(f"{TMP}/ids.npy", "w+", np.int32, (offsets[-1],))
-        labels = np.lib.format.open_memmap(f"{TMP}/labels.npy", "w+", np.int32, (offsets[-1],))
+        ids = np.lib.format.open_memmap(f"{TMP}/ids.npy", "w+", np.int32, (int(offsets[-1]),))
+        labels = np.lib.format.open_memmap(f"{TMP}/labels.npy", "w+", np.int32, (int(offsets[-1]),))
         pos = 0
         for f in shards:
             shard = np.load(f)
