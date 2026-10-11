@@ -14,7 +14,7 @@
 
 import pytest
 import torch
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
@@ -254,3 +254,33 @@ def test_packed_batch_is_flattened_only_for_flex_models_that_consume_thd(
     assert prepared["cu_seqlens_padded"].tolist() == [0, 3, 8, 16]
     assert prepared["cu_seqlens"].tolist() == [0, 3, 7, 15]
     assert prepared["pad_between_seqs"] is True
+
+
+@pytest.mark.parametrize("window", [0, 37, 128, 300])
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        [1000],  # one document over many blocks
+        [130, 1, 127, 256, 300, 50],  # boundaries on, before and after block edges
+        [600, 250],  # 150 trailing tokens past the last boundary
+    ],
+)
+def test_document_block_mask_matches_dense_construction(
+    monkeypatch: pytest.MonkeyPatch, lengths: list[int], window: int
+) -> None:
+    """The block-level construction keeps exactly create_block_mask's partial and full blocks."""
+    monkeypatch.setattr(FlexAttention, "document_block_masks", {})
+    monkeypatch.setattr(FlexAttention, "document_boundaries", None)
+    seq_len = 1000
+    cu_seqlens = _boundaries(lengths, torch.device("cpu"))
+    mask = FlexAttention._get_document_block_mask(cu_seqlens, window, seq_len, torch.device("cpu"))
+    reference = create_block_mask(mask.mask_mod, 1, None, seq_len, seq_len, device="cpu", _compile=False)
+
+    def block_sets(num_blocks: torch.Tensor, indices: torch.Tensor) -> list[set[int]]:
+        return [set(row[:n].tolist()) for n, row in zip(num_blocks[0, 0], indices[0, 0])]
+
+    assert block_sets(mask.kv_num_blocks, mask.kv_indices) == block_sets(reference.kv_num_blocks, reference.kv_indices)
+    assert block_sets(mask.full_kv_num_blocks, mask.full_kv_indices) == block_sets(
+        reference.full_kv_num_blocks, reference.full_kv_indices
+    )
+    assert torch.equal(mask.to_dense(), reference.to_dense())

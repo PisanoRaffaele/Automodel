@@ -16,6 +16,7 @@ from typing import Any, Callable, ClassVar
 
 import torch
 from torch.nn.attention.flex_attention import (
+    _DEFAULT_SPARSE_BLOCK_SIZE,
     BlockMask,
     _mask_mod_signature,
     create_block_mask,
@@ -154,9 +155,9 @@ class FlexAttention(torch.nn.Module):
         mask_key = (sliding_window, seq_len, len(boundaries), device)
         if mask_key not in FlexAttention.document_block_masks:
             positions = torch.arange(seq_len, device=device)
-            ends = cu_seqlens[1:].to(device=device, dtype=positions.dtype).contiguous()
+            starts = cu_seqlens.to(device=device, dtype=positions.dtype).contiguous()
             # document_ids[i] = number of document ends <= i; tokens past the last end share one extra id.
-            document_ids = torch.searchsorted(ends, positions, right=True)
+            document_ids = torch.searchsorted(starts[1:], positions, right=True)
 
             def document_mask(
                 b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
@@ -166,14 +167,42 @@ class FlexAttention(torch.nn.Module):
                     keep = keep & (q_idx - kv_idx < sliding_window)
                 return keep
 
-            FlexAttention.document_block_masks[mask_key] = create_block_mask(
-                document_mask,
-                1,
-                None,
-                seq_len,
-                seq_len,
-                _compile=False,  # NOTE: _compile=True leads to hangs during sampling, so setting it to False for now
-                device=device,
+            # Block sparsity straight from the boundaries: create_block_mask evaluates the mask on the
+            # dense seq_len x seq_len grid (~40 GiB transient at 64k). Query block i needs the
+            # contiguous key blocks from the one holding its first query's earliest visible key
+            # (document start, or the window start) up to the diagonal.
+            block = _DEFAULT_SPARSE_BLOCK_SIZE
+            num_blocks = -(-seq_len // block)
+            blocks = torch.arange(num_blocks, device=device)
+            first = blocks * block
+            last = torch.clamp((blocks + 1) * block, max=seq_len) - 1
+            lowest_key = starts[document_ids[first]]
+            if sliding_window > 0:
+                lowest_key = torch.maximum(lowest_key, first - sliding_window + 1)
+            q_blocks, kv_blocks = blocks[:, None], blocks[None, :]
+            visible = (kv_blocks >= (lowest_key // block)[:, None]) & (kv_blocks <= q_blocks)
+            # A block needs no mask_mod when every (query, key) pair in it is kept: keys strictly before
+            # the queries, all in one document, and (with a window) all within it. As in
+            # create_block_mask, a short trailing block (seq_len not a multiple of the block) is never
+            # full, so the kernel still masks its out-of-range positions.
+            whole = (blocks + 1) * block <= seq_len
+            full = visible & (kv_blocks < q_blocks) & whole[:, None] & whole[None, :]
+            full &= document_ids[first][None, :] == document_ids[last][:, None]
+            if sliding_window > 0:
+                full &= (last[:, None] - first[None, :]) < sliding_window
+            partial = visible & ~full
+
+            def to_kv_blocks(keep: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                # Per query block: how many key blocks are kept, and their indices first (ascending).
+                order = torch.argsort((~keep).to(torch.int8), dim=-1, stable=True)
+                return keep.sum(-1).to(torch.int32)[None, None], order.to(torch.int32)[None, None]
+
+            FlexAttention.document_block_masks[mask_key] = BlockMask.from_kv_blocks(
+                *to_kv_blocks(partial),
+                *to_kv_blocks(full),
+                BLOCK_SIZE=block,
+                mask_mod=document_mask,
+                seq_lengths=(seq_len, seq_len),
             )
 
         return FlexAttention.document_block_masks[mask_key]
