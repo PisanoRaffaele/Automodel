@@ -55,15 +55,16 @@ def tokenize(prefix: str, start: int) -> str:
 def packs():
     """Yield one THD pack per knapsack bin (reads the split's bins/ids/labels/offsets globals)."""
     for b in bins:
-        pack = {"input_ids": [], "labels": [], "position_ids": [], "seq_lens": []}
-        for i in b:
-            lo, hi = offsets[i], offsets[i + 1]
-            pack["input_ids"] += ids[lo:hi].tolist()
-            pack["labels"] += labels[lo:hi].tolist()
-            pack["position_ids"] += range(hi - lo)
-            pack["seq_lens"].append(int(hi - lo))
+        # Arrays end to end: Python int lists made writing 1.9B tokens take hours.
+        spans = [(offsets[i], offsets[i + 1]) for i in b]
+        pack = {
+            "input_ids": np.concatenate([ids[lo:hi] for lo, hi in spans]),
+            "labels": np.concatenate([labels[lo:hi] for lo, hi in spans]),
+            "position_ids": np.concatenate([np.arange(hi - lo) for lo, hi in spans]),
+            "seq_lens": np.array([hi - lo for lo, hi in spans]),
+        }
         out = _tensorize_and_pad_pack(pack, tok.pad_token_id, PACK, CROSS_ENTROPY_IGNORE_IDX)
-        yield {k: v.tolist() for k, v in out.items()}
+        yield {k: v.numpy().astype(np.int32) for k, v in out.items()}
 
 
 if __name__ == "__main__":
