@@ -2,6 +2,7 @@
 # Data: dromedario-3 + tulu-3 + dolci-instruct (deduped w.r.t. tulu), 1 epoch, packed to 65,536.
 # 16 nodes x 4 GPUs, 1 pack per GPU, no CP: 64 x 65,536 = 4,194,304 tok/step, AdamW lr 2e-5.
 #
+#   ./run.sh src/data/dolci.py        configs/sft/minervav2_20b_64k.yaml   # login node, once
 #   ./run.sh src/data/split.py        configs/sft/minervav2_20b_64k.yaml   # login node, once
 #   ./run.sh slurm/prepack.sbatch.sh  configs/sft/minervav2_20b_64k.yaml   # CPU job, once
 #   ./run.sh slurm/sft.sbatch.sh      configs/sft/minervav2_20b_64k.yaml
@@ -17,8 +18,13 @@ prep:
   sources:
     - /leonardo_scratch/large/userexternal/rpisano1/sft_data/dromedario-3-sft-transl.jsonl
     - /leonardo_scratch/large/userexternal/rpisano1/sft_data/tulu-3-sft-mixture.jsonl
-    # TODO: dolci-instruct deduped w.r.t. tulu (path pending)
+    - /leonardo_scratch/large/userexternal/rpisano1/sft_data/dolci-instruct-sft-notulu.jsonl
   val_every: 200
+  # src/data/dolci.py: minerva-post-training/Dolci-Instruct-SFT parquet -> the dolci source above
+  # (drops isin_tulu3 rows, tool use, rows without a target, thinking residue).
+  dolci:
+    parquet_dir: /leonardo_scratch/large/userexternal/rpisano1/sft_data/minerva-Dolci-Instruct-SFT/data
+    out: /leonardo_scratch/large/userexternal/rpisano1/sft_data/dolci-instruct-sft-notulu.jsonl
 
 # Slurm job (run.sh -> sbatch); ignored by the recipe.
 run:
