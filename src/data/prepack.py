@@ -91,6 +91,9 @@ if __name__ == "__main__":
             n = shard["ids"].size
             ids[pos : pos + n], labels[pos : pos + n] = shard["ids"], shard["labels"]
             pos += n
+        # Reopen read-only: the filled pages would otherwise stay dirty and count against the job's memory.
+        ids.flush(), labels.flush()
+        ids, labels = np.load(f"{TMP}/ids.npy", mmap_mode="r"), np.load(f"{TMP}/labels.npy", mmap_mode="r")
 
         bins = greedy_knapsack(lens.tolist(), PACK)
         print(
@@ -104,6 +107,8 @@ if __name__ == "__main__":
                 for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded")
             }
         )
-        Dataset.from_generator(packs, features=features, cache_dir=out + ".cache").save_to_disk(out)
+        Dataset.from_generator(
+            packs, features=features, cache_dir=out + ".cache", writer_batch_size=50
+        )  # 1000 x 64k-token packs as lists ~ 11 GB.save_to_disk(out)
         shutil.rmtree(TMP), shutil.rmtree(out + ".cache")
         print(f"saved {out}", flush=True)
