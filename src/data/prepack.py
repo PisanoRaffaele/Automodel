@@ -16,7 +16,7 @@ import sys
 
 import numpy as np
 import yaml
-from datasets import Dataset, Features, Sequence, Value
+from datasets import Dataset, Features, Sequence, Value, load_from_disk
 from transformers import AutoTokenizer
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
@@ -108,8 +108,10 @@ if __name__ == "__main__":
                 for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded")
             }
         )
-        Dataset.from_generator(
-            packs, features=features, cache_dir=out + ".cache", writer_batch_size=50
-        )  # 1000 x 64k-token packs as lists ~ 11 GB.save_to_disk(out)
+        # writer_batch_size: the default 1000 packs per flush is ~11 GB at 64k.
+        dataset = Dataset.from_generator(packs, features=features, cache_dir=out + ".cache", writer_batch_size=50)
+        dataset.save_to_disk(out)
+        saved = load_from_disk(out)
+        assert len(saved) == len(bins) and sum(map(sum, saved["seq_lens"])) == lens.sum(), f"bad save in {out}"
         shutil.rmtree(TMP), shutil.rmtree(out + ".cache")
-        print(f"saved {out}", flush=True)
+        print(f"saved {out}: {len(saved)} packs, {lens.sum()} tokens", flush=True)
