@@ -18,7 +18,7 @@ if [[ "$RUN_FILE" == *.py ]]; then
 fi
 
 SBATCH_ARGS=()
-if [[ "$RUN_FILE" == */sft.sbatch.sh ]]; then
+if [[ "$RUN_FILE" == */sft.sbatch.sh || "$RUN_FILE" == */sweep.sbatch.sh ]]; then
     read -r NODES TRAIN_NODES QOS TIME EXCLUDE <<< "$(python - "${@:2}" <<'PY'
 import sys, yaml
 run = yaml.safe_load(open(sys.argv[1])).get("run") or {}

@@ -6,6 +6,7 @@
 #   ./run.sh src/data/split.py        configs/sft/minervav2_20b_64k.yaml   # login node, once
 #   ./run.sh slurm/prepack.sbatch.sh  configs/sft/minervav2_20b_64k.yaml   # CPU job, once
 #   ./run.sh slurm/sft.sbatch.sh      configs/sft/minervav2_20b_64k.yaml
+#   ./run.sh slurm/sweep.sbatch.sh    configs/sft/minervav2_20b_64k.yaml --run.nodes=65 --run.qos=boost_qos_bprod   # run.sweep
 # Debug (8 nodes = debug QOS max), on the val packs:
 #   ./run.sh slurm/sft.sbatch.sh configs/sft/minervav2_20b_64k.yaml --run.nodes=8 --run.qos=boost_qos_dbg \
 #     --run.time=00:30:00 --step_scheduler.global_batch_size=32 --step_scheduler.max_steps=2 \
@@ -28,11 +29,20 @@ prep:
 
 # Slurm job (run.sh -> sbatch); ignored by the recipe.
 run:
+  # Single run (slurm/sft.sbatch.sh): 16 nodes, normal QOS.
   nodes: 16
   qos: normal
   time: "24:00:00"
   # lrdn1209 cannot resolve other nodes' hostnames (2026-10-09); keep it out.
   exclude: lrdn1209
+  # Sweep (slurm/sweep.sbatch.sh, with --run.nodes=65 --run.qos=boost_qos_bprod): 4 runs x 16 nodes
+  # side by side + the batch node; each run's nodes are released when it finishes.
+  sweep_nodes: 16
+  sweep:
+    lr1e5_ep1: --optimizer.lr=1.0e-5 --step_scheduler.num_epochs=1 --lr_scheduler.lr_warmup_steps=13
+    lr2e5_ep1: --optimizer.lr=2.0e-5 --step_scheduler.num_epochs=1 --lr_scheduler.lr_warmup_steps=13
+    lr1e5_ep2: --optimizer.lr=1.0e-5 --step_scheduler.num_epochs=2 --lr_scheduler.lr_warmup_steps=27
+    lr2e5_ep2: --optimizer.lr=2.0e-5 --step_scheduler.num_epochs=2 --lr_scheduler.lr_warmup_steps=27
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -129,12 +139,12 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/minervav2_64k_full_b4Mtok_bf16_lr2e5_ep1_dromedario-tulu-dolcidedup-16n-automodel
+  checkpoint_dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/minervav2_64k_full_b4Mtok_bf16_dromedario-tulu-dolcidedup-16n-automodel
   model_save_format: safetensors
   save_consolidated: final
   max_recent_checkpoints: 5
 
 wandb:
   project: minervav2-sft
-  name: minervav2_64k_full_b4Mtok_bf16_lr2e5_ep1_dromedario-tulu-dolcidedup-16n-automodel
+  name: minervav2_64k_full_b4Mtok_bf16_dromedario-tulu-dolcidedup-16n-automodel
   dir: /leonardo_scratch/large/userexternal/rpisano1/sft/minervav2_20b/wandb
