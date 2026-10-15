@@ -4,9 +4,10 @@ Loader-side packing makes every rank tokenize all 1.55M rows and keep them in RA
 4 ranks/node), and AutoModel's sequential packer fills only ~86% of each pack (~1171 steps vs
 LLaMA-Factory's 1008). Here: ChatDataset (same tokenizer/template/truncation as training) ->
 greedy knapsack (LF's neat_packing algorithm) -> AutoModel's own `_tensorize_and_pad_pack`, so the
-THD collator sees the usual layout. Writes dataset.path and validation_dataset.path.
+THD collator sees the usual layout. Writes validation_dataset.path ("val") and dataset.path ("train")
+from prep.sources, or, for each prep.mixes entry, its path from its sources' train splits.
 
-Usage (CPU job):  ./run.sh slurm/prepack.sbatch.sh <config.yaml> [val|train ...]   (default: both)
+Usage (CPU job):  ./run.sh slurm/prepack.sbatch.sh <config.yaml> [val|train|<mix> ...]   (default: val + train or all mixes)
 """
 
 import multiprocessing as mp
@@ -68,13 +69,19 @@ def packs():
 
 
 if __name__ == "__main__":
-    for split in sys.argv[2:] or ("val", "train"):
-        out = cfg["validation_dataset" if split == "val" else "dataset"]["path"]
+    mixes = cfg["prep"].get("mixes") or {}
+    targets = {
+        "val": ("val", cfg["validation_dataset"]["path"], cfg["prep"]["sources"]),
+        "train": ("train", cfg["dataset"]["path"], cfg["prep"]["sources"]),
+        **{name: ("train", mix["path"], mix["sources"]) for name, mix in mixes.items()},
+    }
+    for target in sys.argv[2:] or ("val", *(mixes or ["train"])):
+        split, out, sources = targets[target]
         TMP = out + ".tmp"
         os.makedirs(TMP, exist_ok=True)
         # One source at a time, so only one file's raw rows are in RAM.
         shards = []
-        for src in cfg["prep"]["sources"]:
+        for src in sources:
             ds = ChatDataset([src.removesuffix(".jsonl") + f".{split}.jsonl"], tok, seq_length=PACK, truncation=True)
             prefix = os.path.basename(src).removesuffix(".jsonl")
             with mp.get_context("fork").Pool(int(os.environ.get("SLURM_CPUS_PER_TASK", 4))) as pool:
@@ -98,7 +105,7 @@ if __name__ == "__main__":
 
         bins = greedy_knapsack(lens.tolist(), PACK)
         print(
-            f"{split}: {len(lens)} rows, {lens.sum()} tok -> {len(bins)} packs, fill {lens.sum() / len(bins) / PACK:.2%}"
+            f"{target}: {len(lens)} rows, {lens.sum()} tok -> {len(bins)} packs, fill {lens.sum() / len(bins) / PACK:.2%}"
             f", {len(bins) / cfg['step_scheduler']['global_batch_size']:.1f} steps",
             flush=True,
         )
