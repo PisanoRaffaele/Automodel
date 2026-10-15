@@ -35,6 +35,7 @@ def prompt_key(messages: list) -> bytes:
 
 
 def ref_rows():
+    """(row, original id) for each ref row."""
     with open(dedup["ref"]) as f:
         for line in f:
             row = json.loads(line)

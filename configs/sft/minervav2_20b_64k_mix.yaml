@@ -64,12 +64,18 @@ run:
   exclude: lrdn1209
   # Sweep (slurm/sweep.sbatch.sh, with --run.nodes=65 --run.qos=boost_qos_bprod): 4 runs x 16 nodes
   # side by side + the batch node; each run's nodes are released when it finishes. Warmup = 3% of steps.
+  # 2026-10-14, data mixes at lr 1e-5 (val 0.7719 / 0.7053 / 0.7648 / 0.7444):
+  #   v6: --dataset.path=<packed>/minervav2_64k_mix_v6_train --lr_scheduler.lr_warmup_steps=7
+  #   v6_dromedario_tulu_dolci: --dataset.path=<packed>/minervav2_64k_mix_v6_dromedario_tulu_dolci_train --lr_scheduler.lr_warmup_steps=16
+  #   dromedario_tulu: --dataset.path=<packed>/minervav2_64k_mix_dromedario_tulu_train --lr_scheduler.lr_warmup_steps=8
+  #   dromedario_dolci: --dataset.path=<packed>/minervav2_64k_mix_dromedario_dolci_train --lr_scheduler.lr_warmup_steps=8
+  # Now: lr sweep on the full mix (534 steps, warmup 16).
   sweep_nodes: 16
   sweep:
-    v6: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_v6_train --lr_scheduler.lr_warmup_steps=7
-    v6_dromedario_tulu_dolci: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_v6_dromedario_tulu_dolci_train --lr_scheduler.lr_warmup_steps=16
-    dromedario_tulu: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_dromedario_tulu_train --lr_scheduler.lr_warmup_steps=8
-    dromedario_dolci: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_dromedario_dolci_train --lr_scheduler.lr_warmup_steps=8
+    v6_dromedario_tulu_dolci_lr2e5: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_v6_dromedario_tulu_dolci_train --lr_scheduler.lr_warmup_steps=16 --optimizer.lr=2.0e-5
+    v6_dromedario_tulu_dolci_lr3e5: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_v6_dromedario_tulu_dolci_train --lr_scheduler.lr_warmup_steps=16 --optimizer.lr=3.0e-5
+    v6_dromedario_tulu_dolci_lr5e5: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_v6_dromedario_tulu_dolci_train --lr_scheduler.lr_warmup_steps=16 --optimizer.lr=5.0e-5
+    v6_dromedario_tulu_dolci_lr8e5: --dataset.path=/leonardo_scratch/fast/IscrC_MNLP26/rpisano1/sft_data/packed/minervav2_64k_mix_v6_dromedario_tulu_dolci_train --lr_scheduler.lr_warmup_steps=16 --optimizer.lr=8.0e-5
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
